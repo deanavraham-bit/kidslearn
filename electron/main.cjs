@@ -11,8 +11,19 @@ app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 let mainWindow;
 let serverProcess;
 let serverLog = '';
+let quitting = false;
+let restartTimes = [];   // timestamps of recent auto-restarts
 
 const SERVER_PORT = 3001;
+
+// Persist server output so a mid-session crash always leaves evidence
+// (%APPDATA%\KidsLearn\server.log).
+function appendServerLog(line) {
+  serverLog += line;
+  try {
+    fs.appendFileSync(path.join(app.getPath('userData'), 'server.log'), line);
+  } catch {}
+}
 
 // Resolve a bundled file robustly across dev and packaged (asar on/off) layouts.
 function getResourcePath(rel) {
@@ -30,8 +41,8 @@ function getResourcePath(rel) {
 function startServer() {
   const serverFile = getResourcePath('server/index.js');
   const userDataDir = path.join(app.getPath('userData'), 'data');
-  serverLog += `[main] starting server: ${serverFile}\n`;
-  serverLog += `[main] data dir: ${userDataDir}\n`;
+  appendServerLog(`[main ${new Date().toISOString()}] starting server: ${serverFile}\n`);
+  appendServerLog(`[main] data dir: ${userDataDir}\n`);
 
   serverProcess = spawn(process.execPath, [serverFile], {
     env: {
@@ -42,10 +53,25 @@ function startServer() {
     },
     stdio: 'pipe',
   });
-  serverProcess.stdout?.on('data', d => { const s = d.toString(); serverLog += '[server] ' + s; console.log('[server]', s.trim()); });
-  serverProcess.stderr?.on('data', d => { const s = d.toString(); serverLog += '[server:err] ' + s; console.error('[server]', s.trim()); });
-  serverProcess.on('error', err => { serverLog += '[server:spawn-error] ' + err.message + '\n'; });
-  serverProcess.on('exit', code => { serverLog += `[server] exited with code ${code}\n`; console.log('[server] exited', code); });
+  serverProcess.stdout?.on('data', d => { const s = d.toString(); appendServerLog('[server] ' + s); console.log('[server]', s.trim()); });
+  serverProcess.stderr?.on('data', d => { const s = d.toString(); appendServerLog('[server:err] ' + s); console.error('[server]', s.trim()); });
+  serverProcess.on('error', err => { appendServerLog('[server:spawn-error] ' + err.message + '\n'); });
+  serverProcess.on('exit', code => {
+    appendServerLog(`[server ${new Date().toISOString()}] exited with code ${code}\n`);
+    console.log('[server] exited', code);
+    // The server must never stay down mid-session: restart it automatically
+    // (at most 5 times in 5 minutes so a hard-broken install can't loop).
+    if (quitting) return;
+    const now = Date.now();
+    restartTimes = restartTimes.filter(t => now - t < 5 * 60 * 1000);
+    if (restartTimes.length >= 5) {
+      appendServerLog('[main] too many restarts — giving up\n');
+      return;
+    }
+    restartTimes.push(now);
+    appendServerLog('[main] restarting server in 1s...\n');
+    setTimeout(() => { if (!quitting) startServer(); }, 1000);
+  });
 }
 
 function waitForServer(retries = 50) {
@@ -137,10 +163,12 @@ if (!gotLock) {
 }
 
 app.on('window-all-closed', () => {
+  quitting = true;
   if (serverProcess) { try { serverProcess.kill(); } catch {} }
   if (process.platform !== 'darwin') app.quit();
 });
 
 app.on('before-quit', () => {
+  quitting = true;
   if (serverProcess) { try { serverProcess.kill(); } catch {} }
 });

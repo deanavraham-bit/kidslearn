@@ -36,6 +36,26 @@ import { spawn } from 'child_process';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+// ── Crash safety net ────────────────────────────────────────────────────────
+// The server is the kids' whole app: it must never die mid-session. Any
+// uncaught error (incl. a rejected async route — Express 4 doesn't catch
+// those) is appended to server-crash.log in the data dir and the process
+// KEEPS RUNNING. The log names the culprit if something still misbehaves.
+const CRASH_LOG = path.join(
+  process.env.KIDSLEARN_DATA_DIR || path.join(__dirname, 'data'),
+  'server-crash.log',
+);
+function logCrash(kind, err) {
+  const line = `[${new Date().toISOString()}] ${kind}: ${err?.stack || err}\n`;
+  console.error(line.trim());
+  import('fs').then(({ appendFileSync, mkdirSync }) => {
+    try { mkdirSync(path.dirname(CRASH_LOG), { recursive: true }); } catch {}
+    try { appendFileSync(CRASH_LOG, line); } catch {}
+  }).catch(() => {});
+}
+process.on('uncaughtException', err => logCrash('uncaughtException', err));
+process.on('unhandledRejection', err => logCrash('unhandledRejection', err));
+
 const app = express();
 app.use(cors());
 // Allow larger bodies so child photos (base64 data URLs) fit comfortably
@@ -814,41 +834,50 @@ app.delete('/api/children/:id', (req, res) => {
 });
 
 app.post('/api/save-session', async (req, res) => {
-  const { child, childName, date, results, subject, practice } = req.body;
-  if (!child || !results) return res.status(400).json({ error: 'Missing data' });
+  // A kid's finished session must never be lost to an exception: everything
+  // here is wrapped so a failure returns 500 (client can retry) instead of
+  // hanging the request or killing the process (async throws in Express 4
+  // become unhandled rejections).
+  try {
+    const { child, childName, date, results, subject, practice } = req.body;
+    if (!child || !results) return res.status(400).json({ error: 'Missing data' });
 
-  // The mistakes collection always updates: new mistakes join it, questions
-  // solved correctly on the first attempt leave it. Runs BEFORE the session
-  // is written to history — the first call lazily backfills from history, and
-  // saving first would make it count this session's results twice.
-  updateMistakes(child, subject || 'math', results);
+    // The mistakes collection always updates: new mistakes join it, questions
+    // solved correctly on the first attempt leave it. Runs BEFORE the session
+    // is written to history — the first call lazily backfills from history, and
+    // saving first would make it count this session's results twice.
+    updateMistakes(child, subject || 'math', results);
 
-  const session = { child, childName, date, results, subject, practice: !!practice };
-  saveSession(child, session);
+    const session = { child, childName, date, results, subject, practice: !!practice };
+    saveSession(child, session);
 
-  const profile = getChild(child);
-  let progress = null;
-  if (!practice) {
-    // Resurface wrong exercises into review queue for next session (per subject)
-    addWrongToReviewQueue(reviewKey(child, subject), results);
-    // Adaptive difficulty: consecutive successful days climb the child's
-    // prep-track stage / math level automatically. Practice sessions are
-    // remedial by nature and never touch the streak.
-    progress = profile
-      ? applySessionProgress(profile, subject, date || new Date().toISOString().slice(0, 10), results)
-      : null;
+    const profile = getChild(child);
+    let progress = null;
+    if (!practice) {
+      // Resurface wrong exercises into review queue for next session (per subject)
+      addWrongToReviewQueue(reviewKey(child, subject), results);
+      // Adaptive difficulty: consecutive successful days climb the child's
+      // prep-track stage / math level automatically. Practice sessions are
+      // remedial by nature and never touch the streak.
+      progress = profile
+        ? applySessionProgress(profile, subject, date || new Date().toISOString().slice(0, 10), results)
+        : null;
+    }
+
+    // Send email report (non-blocking)
+    sendEmailReport(session, child).catch(err => console.error('Email failed:', err.message));
+
+    // Daily-plan status after this session (for the "day complete" celebration),
+    // and today's sticker when the day's learning was earned.
+    const day = date || new Date().toISOString().slice(0, 10);
+    const planStatus = profile ? getPlanStatus(profile, day) : null;
+    const sticker = profile ? maybeAwardSticker(profile, day, planStatus) : null;
+
+    res.json({ ok: true, progress, planStatus, sticker });
+  } catch (err) {
+    console.error('[save-session] failed:', err?.stack || err);
+    if (!res.headersSent) res.status(500).json({ error: 'שמירת המפגש נכשלה — נסו שוב' });
   }
-
-  // Send email report (non-blocking)
-  sendEmailReport(session, child).catch(err => console.error('Email failed:', err.message));
-
-  // Daily-plan status after this session (for the "day complete" celebration),
-  // and today's sticker when the day's learning was earned.
-  const day = date || new Date().toISOString().slice(0, 10);
-  const planStatus = profile ? getPlanStatus(profile, day) : null;
-  const sticker = profile ? maybeAwardSticker(profile, day, planStatus) : null;
-
-  res.json({ ok: true, progress, planStatus, sticker });
 });
 
 // ── Rewards: stars, streak, sticker album, achievements ───────────────────
@@ -898,6 +927,41 @@ app.get('/api/stats/:child', (req, res) => {
 const ttsCache = new Map();
 const TTS_CACHE_LIMIT = 200;
 
+// In-flight TTS fetches by cache key: many cards request the same phrase in a
+// burst (question + replay button) — fetch Google once, answer everyone.
+const ttsInflight = new Map();
+const TTS_UPSTREAM_TIMEOUT = 6000;   // Google sometimes hangs this endpoint —
+                                     // without a timeout, sockets pile up forever
+
+function fetchTts(url) {
+  return new Promise((resolve, reject) => {
+    const reqUp = https.get(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': '*/*',
+        'Referer': 'https://translate.google.com/',
+      },
+      timeout: TTS_UPSTREAM_TIMEOUT,
+    }, (upstream) => {
+      if (upstream.statusCode !== 200) {
+        upstream.resume();
+        return reject(new Error(`upstream status ${upstream.statusCode}`));
+      }
+      const chunks = [];
+      let size = 0;
+      upstream.on('data', c => {
+        size += c.length;
+        if (size > 5_000_000) { reqUp.destroy(new Error('tts too large')); return; }
+        chunks.push(c);
+      });
+      upstream.on('end', () => resolve(Buffer.concat(chunks)));
+      upstream.on('error', reject);
+    });
+    reqUp.on('timeout', () => reqUp.destroy(new Error('tts upstream timeout')));
+    reqUp.on('error', reject);
+  });
+}
+
 app.get('/api/tts', (req, res) => {
   const text = String(req.query.text || '').slice(0, 200);
   if (!text) return res.status(400).send('Missing text');
@@ -913,35 +977,27 @@ app.get('/api/tts', (req, res) => {
   }
 
   const url = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(text)}&tl=${lang}&client=tw-ob`;
-  https.get(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      'Accept': '*/*',
-      'Referer': 'https://translate.google.com/',
-    },
-  }, (upstream) => {
-    if (upstream.statusCode !== 200) {
-      console.error('[TTS] upstream status', upstream.statusCode);
-      upstream.resume();
-      return res.status(502).send('TTS upstream error');
+  let job = ttsInflight.get(cacheKey);
+  if (!job) {
+    job = fetchTts(url).finally(() => ttsInflight.delete(cacheKey));
+    ttsInflight.set(cacheKey, job);
+  }
+
+  job.then(buf => {
+    if (ttsCache.size >= TTS_CACHE_LIMIT) {
+      const firstKey = ttsCache.keys().next().value;
+      ttsCache.delete(firstKey);
     }
-    const chunks = [];
-    upstream.on('data', c => chunks.push(c));
-    upstream.on('end', () => {
-      const buf = Buffer.concat(chunks);
-      // Cache result (evict oldest if over limit)
-      if (ttsCache.size >= TTS_CACHE_LIMIT) {
-        const firstKey = ttsCache.keys().next().value;
-        ttsCache.delete(firstKey);
-      }
-      ttsCache.set(cacheKey, buf);
-      res.set('Content-Type', 'audio/mpeg');
-      res.set('Cache-Control', 'public, max-age=86400');
-      res.end(buf);
-    });
-  }).on('error', err => {
+    ttsCache.set(cacheKey, buf);
+    // The kid may have moved on before the audio arrived — don't write then.
+    if (res.writableEnded || res.destroyed) return;
+    res.set('Content-Type', 'audio/mpeg');
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.end(buf);
+  }).catch(err => {
     console.error('[TTS] proxy error:', err.message);
-    res.status(500).send('TTS error');
+    if (res.writableEnded || res.destroyed || res.headersSent) return;
+    res.status(504).send('TTS error');
   });
 });
 
