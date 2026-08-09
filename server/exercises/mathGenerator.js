@@ -375,6 +375,32 @@ function operationCategories(operation) {
   return CATEGORIES;
 }
 
+// In the mixed curriculum the subtrahend stays single-digit: "חיסור דו ספרתי"
+// (27 - 14) is still too hard, so we only ask 27 - 5. Addition and subtraction
+// stay within 30. These overrides apply to the mixed session only — leveled
+// sessions and the prep tracks keep the shared GENERATORS untouched.
+const MIXED_SUB_MAX = 9;
+
+const MIXED_GENERATORS = {
+  ...GENERATORS,
+  subtraction_20: () => {
+    const a = randInt(11, 20);
+    const b = randInt(1, Math.min(MIXED_SUB_MAX, a - 1));
+    return { type: 'subtraction_20', difficulty: 2, dir: 'ltr', question: `${a} - ${b} = ?`, answer: a - b, hint: `${a} - ${b}` };
+  },
+  subtraction_30: () => {
+    const a = randInt(21, 30);
+    const b = randInt(1, MIXED_SUB_MAX);
+    return { type: 'subtraction_30', difficulty: 3, dir: 'ltr', question: `${a} - ${b} = ?`, answer: a - b, hint: `${a} - ${b}` };
+  },
+  word_sub: () => {
+    const a = randInt(5, 20);
+    const b = randInt(1, Math.min(MIXED_SUB_MAX, a - 1));
+    const tpl = pick(WORD_PROBLEMS_SUB);
+    return { type: 'word_sub', difficulty: 3, dir: 'rtl', question: tpl(a, b), answer: a - b, hint: `${a} - ${b}` };
+  },
+};
+
 // The original "mixed" curriculum (end-1st / start-2nd grade): arithmetic up
 // to 30 + place value to 100 + sequences + geometry. Used when a child has no
 // explicit mathLevel (e.g. the built-in son profile). `operation` ('add' |
@@ -426,13 +452,13 @@ function generateMixedMath(weakness = {}, reviewExercises = [], operation = 'mix
 
   for (const cat of catSlots) {
     let type = pickTypeForCategory(cat);
-    let ex = GENERATORS[type]();
+    let ex = MIXED_GENERATORS[type]();
     let key = `${ex.type}|${ex.question}`;
     let attempts = 0;
     // Retry on duplicate question; re-pick the type after a few misses.
     while (seen.has(key) && attempts < 25) {
       if (attempts > 6) type = pickTypeForCategory(cat);
-      ex = GENERATORS[type]();
+      ex = MIXED_GENERATORS[type]();
       key = `${ex.type}|${ex.question}`;
       attempts++;
     }
