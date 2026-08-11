@@ -1,0 +1,9 @@
+# Shell scripts must keep LF endings, otherwise bash on macOS/Linux fails with
+# "bad interpreter: /usr/bin/env bash^M" when the file is checked out on Windows.
+*.sh text eol=lf
+gradlew text eol=lf
+
+# Windows scripts stay CRLF.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ps1 text eol=crlf

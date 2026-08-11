@@ -12,17 +12,45 @@
 | 🍎 **macOS** | `KidsLearn-x.x.x.dmg` | פתחו → גררו ל-Applications |
 | 🐧 **Linux** | `KidsLearn-x.x.x.AppImage` | `chmod +x` → כפול קליק |
 
-### התקנה בפקודה אחת
+### התקנה בפקודה אחת — `kidslearn`
+
+מתקינים פעם אחת את הפקודה, ומאז מספיק להקליד `kidslearn` בטרמינל: נפתח תפריט
+לבחירת מערכת ההפעלה, והקובץ הנכון מתוך הגרסה האחרונה יורד ומותקן.
 
 **Windows (PowerShell):**
 ```powershell
-irm https://raw.githubusercontent.com/deanavraham-bit/kidslearn/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/deanavraham-bit/kidslearn/main/cli/install-command.ps1 | iex
 ```
 
 **macOS / Linux (Terminal):**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/deanavraham-bit/kidslearn/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/deanavraham-bit/kidslearn/main/cli/install-command.sh | bash
 ```
+
+לאחר מכן, בטרמינל חדש:
+
+```
+kidslearn
+```
+
+```
+  איזו מערכת הפעלה יש לך?
+
+    [1] Windows  (10 / 11)
+    [2] macOS - Apple Silicon (M1/M2/M3/M4)
+    [3] macOS - Intel
+    [4] Linux  (AppImage - כל הפצה)
+    [5] Linux  (Debian / Ubuntu .deb)
+    [6] Android  (APK - טלפון/טאבלט)
+    [0] יציאה
+```
+
+אפשר גם לדלג על התפריט:
+`kidslearn -Os win` (Windows) או `kidslearn mac-arm` (macOS/Linux) —
+ערכים אפשריים: `win`, `mac-arm`, `mac-intel`, `linux`, `deb`, `android`.
+
+> התקנה ישירה בלי הפקודה (הורדה + הפעלה מיידית):
+> `irm .../install.ps1 | iex` ב-Windows, `curl -fsSL .../install.sh | bash` ב-Mac/Linux.
 
 > כל ההגדרות (כולל סיסמת המייל) נשמרות מקומית בכל מחשב — אין סודות בקבצי ההתקנה.
 
